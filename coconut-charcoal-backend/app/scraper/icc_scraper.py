@@ -1,113 +1,108 @@
-"""
-ICC Price Scraper (ScraperAPI version)
---------------------------------------
-✅ Bypasses Cloudflare
-✅ No Selenium / Chrome needed
-✅ Uses BeautifulSoup to parse tables
-"""
+# app/scraper/icc_scraper.py
 
 from datetime import datetime
-import os
-import re
-from typing import List, Dict
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from bs4 import BeautifulSoup
-import requests
+import random, time, re
+
 
 URL = "https://coconutcommunity.org/page-statistics/weekly-price-update"
-TARGET_PRODUCT = "coconut shell charcoal".lower()
-
-SCRAPER_API_KEY = "1b6f8abd3ac9b68568788ca207358da1"  # ✅ your key here
+TARGET_PRODUCT = "coconut shell charcoal"
 
 
-def _dump_html_for_debug(html: str, name: str = "icc_page_debug.html"):
-    """Save HTML locally so we can inspect when debugging"""
-    out = os.path.join(os.getcwd(), name)
-    with open(out, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"🔍 Saved page HTML to: {out}")
+def simulate_human(page):
+    page.mouse.move(random.randint(50, 800), random.randint(50, 500))
+    page.mouse.wheel(0, random.randint(200, 1600))
+    time.sleep(random.uniform(1.5, 3))
 
 
-def scrape_icc() -> List[Dict]:
-    print("🟡 Fetching page via ScraperAPI (Cloudflare bypass)…")
+def scrape_icc():
+    print("🟡 Launching Playwright browser (stealth)...")
 
-    api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&render=true&url={URL}"
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,  # ✅ must run visible until Cloudflare cleared
+            args=["--disable-blink-features=AutomationControlled"]
+        )
 
-    try:
-        resp = requests.get(api_url, timeout=30)
-    except Exception as e:
-        print("❌ Network error:", e)
-        return []
+        context = browser.new_context(
+            viewport={"width": 1550, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.6099.224 Safari/537.36"
+            )
+        )
 
-    if resp.status_code != 200:
-        print(f"❌ ScraperAPI failed. HTTP {resp.status_code}")
-        return []
+        # remove webdriver flag
+        context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
 
-    html = resp.text
-    _dump_html_for_debug(html)  # ✅ save returned HTML
+        page = context.new_page()
+        page.set_default_timeout(120000)
 
-    # detect Cloudflare / blocked
-    lower = html.lower()
-    if "cloudflare" in lower or "captcha" in lower or "verify you are human" in lower:
-        print("⚠️ Cloudflare still blocking — returning empty")
-        return []
+        print("🌍 Navigating...")
+        page.goto(URL, wait_until="domcontentloaded")  # ⬅ IMPORTANT
 
-    soup = BeautifulSoup(html, "lxml")
+        # ✅ Cloudflare bypass loop
+        for i in range(15):  # max ~25 sec
+            if "Verifying you are human" not in page.content():
+                break
 
-    rows = []
+            print(f"⏳ Cloudflare challenge... ({i+1}/15)")
+            simulate_human(page)
+            time.sleep(2)
 
-    # find all <table> elements
-    for table in soup.find_all("table"):
-        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        # scroll & act human
+        simulate_human(page)
 
-        if not headers:
-            continue
-
-        if "product" not in " ".join(headers):
-            continue
-
-        # find indices
-        def idx_contains(words):
-            for i, h in enumerate(headers):
-                if any(w in h for w in words):
-                    return i
-            return None
-
-        product_idx = idx_contains(["product"])
-        market_idx = idx_contains(["market", "country"])
-        price_idx = idx_contains(["price", "usd", "$", "value"])
-
-        if product_idx is None or price_idx is None:
-            continue
-
-        # iterate table rows
-        for tr in table.find_all("tr")[1:]:
-            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(tds) < max(product_idx, price_idx) + 1:
-                continue
-
-            product_text = tds[product_idx].lower()
-            if TARGET_PRODUCT not in product_text:
-                continue
-
-            market = tds[market_idx] if market_idx is not None else "Unknown"
-
-            price_raw = tds[price_idx].replace(",", "").replace("USD", "").strip()
-            price_clean = re.sub(r"[^\d.]+", "", price_raw)
-
+        # ✅ Wait until table is present (retry based wait)
+        for i in range(20):
             try:
-                price_value = float(price_clean)
-            except:
+                page.locator("table").first.wait_for(timeout=2000)
+                print("✅ Table loaded!")
+                break
+            except PlaywrightTimeout:
+                print("⏳ Waiting table...", i + 1)
+                simulate_human(page)
+
+        html = page.content()
+
+        # save HTML to debug
+        with open("icc_debug.html", "w", encoding="utf-8") as f:
+            f.write(html)
+
+        soup = BeautifulSoup(html, "lxml")
+
+        rows = []
+        for table in soup.find_all("table"):
+            headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+            if not headers or "product" not in " ".join(headers):
                 continue
 
-            rows.append({
-                "date": datetime.utcnow(),
-                "market": market,
-                "product": "Coconut Shell Charcoal",
-                "price": price_value,
-                "currency": "USD",
-                "unit": "per tonne",
-                "source_url": URL
-            })
+            p_idx = next((i for i, h in enumerate(headers) if "product" in h), None)
+            price_idx = next((i for i, h in enumerate(headers) if "usd" in h or "$" in h), None)
+            market_idx = next((i for i, h in enumerate(headers) if "market" in h or "country" in h), None)
 
-    print(f"✅ Extracted {len(rows)} rows from ICC table")
-    return rows
+            for tr in table.find_all("tr")[1:]:
+                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if len(tds) <= max(p_idx, price_idx):
+                    continue
+
+                if TARGET_PRODUCT not in tds[p_idx].lower():
+                    continue
+
+                price_clean = re.sub(r"[^\d.]", "", tds[price_idx])
+                if price_clean:
+                    rows.append({
+                        "date": datetime.utcnow(),
+                        "market": tds[market_idx] if market_idx else "Unknown",
+                        "product": "Coconut Shell Charcoal",
+                        "price": float(price_clean),
+                        "currency": "USD",
+                        "unit": "per tonne",
+                        "source_url": URL,
+                    })
+
+        browser.close()
+        print(f"✅ Extracted {len(rows)} rows")
+        return rows

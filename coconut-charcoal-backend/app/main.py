@@ -1,30 +1,32 @@
 # app/main.py
 from __future__ import annotations
-from fastapi import FastAPI, Depends, Query
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.concurrency import run_in_threadpool   # ✅ allows sync Playwright inside async FastAPI
-from datetime import datetime
-from typing import Optional, List, Dict, Any
-from .config import settings
-from .db import get_db, get_client
-from .scraper.icc_scraper import scrape_icc
-from .services.aggregator import basic_stats, month_averages, mom_change, compare_periods
-
 import sys
 import asyncio
 
-# ✅ FIX: Required for Playwright on Windows
+# -------------------------------------------------------
+# ✅ MUST be set BEFORE importing Playwright & FastAPI
+# -------------------------------------------------------
 if sys.platform.startswith("win"):
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
+from fastapi import FastAPI, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
+from datetime import datetime
+from typing import Optional, List
+
+from .config import settings
+from .db import get_db, get_client
+from .services.aggregator import basic_stats, month_averages, mom_change, compare_periods
+from .scraper.icc_scraper import scrape_icc   # <-- SYNC scraper (uses sync playwright)
 
 app = FastAPI(
     title="Coconut Shell Charcoal API",
-    version="1.0.0",
+    version="1.0.0"
 )
 
 # -------------------------------------------------------
-# ✅ Enable CORS (for frontend)
+# ✅ CORS for frontend
 # -------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -35,14 +37,14 @@ app.add_middleware(
 )
 
 # -------------------------------------------------------
-# ✅ Test DB connection on startup
+# ✅ Test DB connection at startup
 # -------------------------------------------------------
 @app.on_event("startup")
 async def startup_db_connection():
     try:
         client = await get_client()
         await client.admin.command("ping")
-        print("✅ MongoDB connected!")
+        print("✅ MongoDB connected")
     except Exception as e:
         print("❌ MongoDB connection failed:", e)
 
@@ -51,37 +53,38 @@ async def startup_db_connection():
 async def health():
     return {"status": "running", "timestamp": datetime.utcnow().isoformat()}
 
-
 # -------------------------------------------------------
 # ✅ SCRAPE + SAVE TO DB
 # -------------------------------------------------------
-from starlette.concurrency import run_in_threadpool
-
 @app.post("/scrape")
 async def scrape_and_save(db=Depends(get_db)):
-    rows = await run_in_threadpool(scrape_icc)   # run the sync selenium scraper
+    print("🔄 Starting scrape job...")
+
+    # ⬅ Run sync Playwright safely on a thread
+    rows = await run_in_threadpool(scrape_icc)
 
     if not rows:
-        return {"saved": 0, "skipped": 0, "total": 0, "note": "No rows extracted (site blocked or charcoal not listed)"}
+        print("⚠️ No data extracted or Cloudflare blocked")
+        return {"status": "blocked_or_empty", "saved": 0, "skipped": 0, "total": 0}
 
     saved = skipped = 0
     for row in rows:
         result = await db["prices"].update_one(
             {"date": row["date"], "market": row["market"], "product": row["product"]},
             {"$setOnInsert": row},
-            upsert=True
+            upsert=True,
         )
-        if getattr(result, "upserted_id", None):
+        if result.upserted_id:
             saved += 1
         else:
             skipped += 1
 
-    return {"saved": saved, "skipped": skipped, "total": len(rows)}
-
+    print(f"✅ Saved: {saved}, Skipped: {skipped}")
+    return {"status": "ok", "saved": saved, "skipped": skipped, "total": len(rows)}
 
 
 # -------------------------------------------------------
-# ✅ Get markets list
+# ✅ Get markets
 # -------------------------------------------------------
 @app.get("/markets")
 async def list_markets(db=Depends(get_db)):
@@ -89,7 +92,7 @@ async def list_markets(db=Depends(get_db)):
 
 
 # -------------------------------------------------------
-# ✅ Get saved prices
+# ✅ Get raw price dataset
 # -------------------------------------------------------
 @app.get("/prices")
 async def get_prices(
@@ -131,25 +134,7 @@ async def get_stats(markets: Optional[List[str]] = Query(default=None), db=Depen
 
 
 # -------------------------------------------------------
-# ✅ Month-over-month trend
-# -------------------------------------------------------
-@app.get("/mom")
-async def get_mom(markets: Optional[List[str]] = Query(default=None), db=Depends(get_db)):
-    query = {"product": "Coconut Shell Charcoal"}
-    if markets:
-        query["market"] = {"$in": markets}
-
-    cursor = db["prices"].find(query).sort("date", 1)
-    grouped = {}
-
-    async for rec in cursor:
-        grouped.setdefault(rec["market"], []).append(rec)
-
-    return {m: mom_change(month_averages(r)) for m, r in grouped.items()}
-
-
-# -------------------------------------------------------
-# ✅ Compare A vs B date range
+# ✅ Compare two periods (date range)
 # -------------------------------------------------------
 @app.get("/compare")
 async def compare(
