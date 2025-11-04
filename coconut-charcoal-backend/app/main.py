@@ -18,13 +18,13 @@ from typing import Optional, List
 from .config import settings
 from .db import get_db, get_client
 from .services.aggregator import basic_stats, month_averages, mom_change, compare_periods
-from .scraper.icc_scraper import scrape_icc    # <-- Sync scraper
+from .scraper.icc_scraper import scrape_icc
 from .pdf.pdf_parser import extract_prices_from_pdf
 
 
 app = FastAPI(
-    title="Coconut Shell Charcoal API",
-    version="1.0.0"
+    title="Coconut Data API",
+    version="2.0.0"
 )
 
 # -------------------------------------------------------
@@ -61,13 +61,9 @@ async def health():
 # -------------------------------------------------------
 @app.post("/scrape")
 async def scrape_and_save(db=Depends(get_db)):
-    print("🔄 Starting scrape job...")
-
-    # ⬅ Run Playwright (sync) inside threadpool (because FastAPI is async)
     rows = await run_in_threadpool(scrape_icc)
 
     if not rows:
-        print("⚠️ No data extracted / Cloudflare blocked")
         return {"status": "blocked_or_empty", "saved": 0, "skipped": 0}
 
     saved = skipped = 0
@@ -78,7 +74,6 @@ async def scrape_and_save(db=Depends(get_db)):
             {"$setOnInsert": row},
             upsert=True,
         )
-
         if result.upserted_id:
             saved += 1
         else:
@@ -88,26 +83,23 @@ async def scrape_and_save(db=Depends(get_db)):
 
 
 # -------------------------------------------------------
-# ✅ Upload PDF (manual data import)
+# ✅ Upload PDF (manual import from ICC)
 # -------------------------------------------------------
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), db=Depends(get_db)):
+    os.makedirs("uploads", exist_ok=True)
     path = f"uploads/{file.filename}"
+
     with open(path, "wb") as f:
         f.write(await file.read())
 
-    from .pdf.pdf_parser import extract_prices_from_pdf
-
     rows = extract_prices_from_pdf(path)
-
-    print("\n🔍 Parsed rows before DB insert:")
-    for r in rows:
-        print(r)
+    print("\n🔍 Parsed rows before DB insert:", rows)
 
     saved = 0
     for row in rows:
         result = await db["prices"].update_one(
-            {"market": row["market"], "product": row["product"], "date": row["date"]},
+            {"product": row["product"], "market": row["market"], "date": row["date"]},
             {"$setOnInsert": row},
             upsert=True,
         )
@@ -117,24 +109,37 @@ async def upload_pdf(file: UploadFile = File(...), db=Depends(get_db)):
     return {"status": "success", "uploaded": file.filename, "saved_to_db": saved}
 
 
+# -------------------------------------------------------
+# ✅ NEW: Get list of products (dynamic from DB)
+# -------------------------------------------------------
+@app.get("/products")
+async def get_products(db=Depends(get_db)):
+    products = await db["prices"].distinct("product")
+    return sorted(products)
+
 
 # -------------------------------------------------------
-# ✅ List markets
+# ✅ NEW: Get markets by selected product
 # -------------------------------------------------------
-@app.get("/markets")
-async def list_markets(db=Depends(get_db)):
-    return sorted(await db["prices"].distinct("market"))
-
-
-# -------------------------------------------------------
-# ✅ Get raw price dataset
-# -------------------------------------------------------
-@app.get("/prices")
-async def get_prices(
-    market: Optional[str] = Query(default=None),
+@app.get("/markets-by-product")
+async def get_markets_by_product(
+    product: str = Query(...),
     db=Depends(get_db)
 ):
-    query = {"product": "Coconut Shell Charcoal"}
+    markets = await db["prices"].distinct("market", {"product": product})
+    return sorted(markets)
+
+
+# -------------------------------------------------------
+# ✅ NEW: Get prices filtered by product + market
+# -------------------------------------------------------
+@app.get("/prices-filtered")
+async def get_filtered_prices(
+    product: str = Query(...),
+    market: str = Query(None),
+    db=Depends(get_db)
+):
+    query = {"product": product}
     if market:
         query["market"] = market
 
@@ -143,15 +148,61 @@ async def get_prices(
 
 
 # -------------------------------------------------------
-# ✅ Aggregated statistics for charts
+# ✅ NEW: Analytics for dashboard (min, max, avg, and MoM%)
 # -------------------------------------------------------
+@app.get("/analytics")
+async def get_analytics(
+    product: str = Query(...),
+    market: str = Query(...),
+    db=Depends(get_db)
+):
+    cursor = db["prices"].find({"product": product, "market": market}).sort("date", 1)
+    rows = [doc async for doc in cursor]
+
+    if not rows:
+        return {"message": "No data"}
+
+    prices = [r["price"] for r in rows]
+    mom_change_pct = None
+
+    if len(prices) >= 2:
+        mom_change_pct = ((prices[-1] - prices[-2]) / prices[-2]) * 100
+
+    return {
+        "product": product,
+        "market": market,
+        "min": min(prices),
+        "max": max(prices),
+        "avg": round(sum(prices) / len(prices), 2),
+        "latest_price": prices[-1],
+        "mom_change_percentage": round(mom_change_pct, 2) if mom_change_pct else None
+    }
+
+
+# -------------------------------------------------------
+# ✅ OLD APIs (still supported)
+# -------------------------------------------------------
+@app.get("/markets")
+async def list_markets(db=Depends(get_db)):
+    return sorted(await db["prices"].distinct("market"))
+
+
+@app.get("/prices")
+async def get_prices(
+    market: Optional[str] = Query(default=None),
+    db=Depends(get_db)
+):
+    query = {}
+    if market:
+        query["market"] = market
+
+    cursor = db["prices"].find(query, projection={"_id": 0}).sort("date", 1)
+    return [doc async for doc in cursor]
+
+
 @app.get("/stats")
 async def get_stats(markets: Optional[List[str]] = Query(default=None), db=Depends(get_db)):
-    query = {"product": "Coconut Shell Charcoal"}
-    if markets:
-        query["market"] = {"$in": markets}
-
-    cursor = db["prices"].find(query)
+    cursor = db["prices"].find({})
     dataset = [doc async for doc in cursor]
 
     grouped = {}
@@ -168,9 +219,6 @@ async def get_stats(markets: Optional[List[str]] = Query(default=None), db=Depen
     }
 
 
-# -------------------------------------------------------
-# ✅ Compare two periods (dashboard feature)
-# -------------------------------------------------------
 @app.get("/compare")
 async def compare(
     startA: datetime, endA: datetime,
@@ -178,11 +226,7 @@ async def compare(
     markets: Optional[List[str]] = Query(default=None),
     db=Depends(get_db)
 ):
-    query = {"product": "Coconut Shell Charcoal"}
-    if markets:
-        query["market"] = {"$in": markets}
-
-    cursor = db["prices"].find(query).sort("date", 1)
+    cursor = db["prices"].find({}).sort("date", 1)
     grouped = {}
 
     async for rec in cursor:
