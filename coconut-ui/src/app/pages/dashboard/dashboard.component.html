@@ -1,0 +1,27 @@
+<div class="container p-4">
+
+  <h2 class="text-2xl font-bold mb-6">🌴 Coconut Market Dashboard</h2>
+
+  <div class="grid grid-cols-2 gap-4">
+
+    <select [(ngModel)]="selectedProduct"
+            (change)="onProductChange()"
+            class="p-2 border rounded">
+      <option value="">Select Product</option>
+      <option *ngFor="let p of products">{{p}}</option>
+    </select>
+
+    <select [(ngModel)]="selectedMarket"
+            (change)="onMarketChange()"
+            class="p-2 border rounded">
+      <option value="">Select Market</option>
+      <option *ngFor="let m of markets">{{m}}</option>
+    </select>
+
+  </div>
+
+  <app-price-chart [prices]="prices"></app-price-chart>
+
+  <app-stats-cards [stats]="stats"></app-stats-cards>
+
+</div>
