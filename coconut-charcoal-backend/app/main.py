@@ -30,13 +30,16 @@ app = FastAPI(
 # -------------------------------------------------------
 # ✅ CORS for frontend
 # -------------------------------------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=["*"],   # ✅ allow all (temporary)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------------------------------------------
 # ✅ Test DB connection at startup
@@ -236,3 +239,8 @@ async def compare(
         market: compare_periods(rows, startA, endA, startB, endB)
         for market, rows in grouped.items()
     }
+
+@app.delete("/clear-db")
+async def clear_db(db=Depends(get_db)):
+    result = await db["prices"].delete_many({})
+    return {"deleted": result.deleted_count}

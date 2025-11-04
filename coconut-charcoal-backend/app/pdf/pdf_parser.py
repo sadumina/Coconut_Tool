@@ -5,55 +5,76 @@ from datetime import datetime
 def extract_prices_from_pdf(path: str):
     rows = []
 
-    print("\n📄 Parsing PDF file:", path)
+    print(f"\n📄 Parsing PDF: {path}")
 
     with pdfplumber.open(path) as pdf:
-        raw_text = "\n".join(page.extract_text() for page in pdf.pages)
+        lines = []
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                lines.extend(text.split("\n"))
 
-    print("\n------ RAW TEXT (debug) ------")
-    print(raw_text)
-    print("------------------------------\n")
+    # DEBUG (optional)
+    print("\n🟦 RAW LINES EXTRACTED FROM PDF (first 40 lines):")
+    for idx, line in enumerate(lines[:40]):
+        print(f"{idx}: {line}")
 
-    # ✅ Extract date header row (week dates)
-    date_matches = re.findall(r"(\d{2}/\d{2}/\d{4})", raw_text)
-    print("📅 Extracted dates:", date_matches)
-    column_dates = date_matches[:5]  # sometimes 4 or 5 weeks exist
+    # ✅ Extract dates from header line (week columns)
+    date_matches = re.findall(r"(\d{2}/\d{2}/\d{4})", "\n".join(lines))
+    print("\n📅 Week dates:", date_matches)
 
-    # ✅ Regex captures ANY PRODUCT + MARKET + PRICES
-    pattern = r"([A-Za-z ()*,]+)\s+([A-Za-z ()/,]+)\s+([0-9\sNQ\.,-]+)"
-    matches = re.findall(pattern, raw_text)
+    if len(date_matches) == 0:
+        print("❌ No week dates found. PDF format changed.")
+        return []
 
-    print(f"🔍 Matched product rows: {len(matches)}")
+    week_dates = date_matches[:5]  # Max 5 weeks
 
-    for product, market, price_block in matches:
-        product = product.strip()
-        market = market.strip()
+    # ✅ Process table rows
+    current_product = None
+    current_market = None
 
-        # Extract number fragments (can be broken like 6 18 → 618)
-        digits = re.findall(r"(\d+)", price_block)
+    for line in lines:
+        line = line.strip()
 
-        print(f"\n➡️ {product} | {market}")
-        print(f"   🧩 Raw number tokens: {digits}")
+        # skip headers and footers
+        if ("Note:" in line) or ("Source:" in line) or line.startswith("Products"):
+            continue
 
-        # Fix broken numbers intelligently
-        fixed_prices = []
-        tmp = ""
-        for d in digits:
-            tmp += d
-            if len(tmp) >= 3:  # coconut industry prices are 3+ digits
-                fixed_prices.append(tmp)
-                tmp = ""
+        # Detect product + market
+        # Example match: "Coconut Shell Charcoal Indonesia (FOB)"
+        product_market_match = re.match(r"([A-Za-z ]+?)\s+([A-Za-z]+.*)", line)
 
-        print(f"   ✅ Fixed prices: {fixed_prices}")
+        if product_market_match and not re.search(r"\d", line):
+            current_product = product_market_match.group(1).strip()
+            current_market = product_market_match.group(2).strip()
+            continue
 
-        # Insert into result set
-        for i, price in enumerate(fixed_prices[:len(column_dates)]):
-            rows.append({
-                "product": product,
-                "market": market,
-                "price": float(price),
-                "date": datetime.strptime(column_dates[i], "%d/%m/%Y"),
-            })
+        # ✅ Detect a price row (must contain numbers)
+        price_tokens = re.findall(r"\d[\d\s,]*", line)
 
-    print(f"\n✅ FINAL ROW COUNT: {len(rows)} extracted")
+        if current_product and price_tokens:
+            cleaned_prices = []
+
+            # Fix fragmented numbers like "3 206" -> "3206"
+            tmp = ""
+            for token in price_tokens:
+                token = token.replace(",", "").strip()
+                tmp += token
+                if len(tmp) >= 3:
+                    cleaned_prices.append(tmp)
+                    tmp = ""
+
+            # Insert rows only when price count equals week dates count
+            if len(cleaned_prices) == len(week_dates):
+                print(f"➡️ {current_product} | {current_market} → {cleaned_prices}")
+
+                for i, price in enumerate(cleaned_prices):
+                    rows.append({
+                        "product": current_product,
+                        "market": current_market,
+                        "price": float(price),
+                        "date": datetime.strptime(week_dates[i], "%d/%m/%Y"),
+                    })
+
+    print(f"\n✅ FINAL PDF ROW COUNT: {len(rows)} records returned.")
     return rows
